@@ -6,15 +6,25 @@ from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
+import shutil
 import torch
 import librosa
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from langchain_google_genai import ChatGoogleGenerativeAI
+try:
+    import imageio_ffmpeg as iio_ffmpeg  # bundled ffmpeg binary for cloud
+except Exception:
+    iio_ffmpeg = None
 
 
 
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# Prefer Streamlit secrets, then env
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or (
+    st.secrets.get("GOOGLE_API_KEY") if "GOOGLE_API_KEY" in st.secrets else None
+)
+if GOOGLE_API_KEY:
+    os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
 
 BASE_DIR = Path(__file__).resolve().parent
 VIDEO_DIR_CANDIDATES = [
@@ -137,7 +147,8 @@ def concat_videos_ffmpeg(input_paths: list[str], output_path: Path) -> None:
     if not input_paths:
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd: list[str] = ["ffmpeg", "-y"]
+    ffmpeg_bin = iio_ffmpeg.get_ffmpeg_exe() if iio_ffmpeg else (shutil.which("ffmpeg") or "ffmpeg")
+    cmd: list[str] = [ffmpeg_bin, "-y"]
     for p in input_paths:
         cmd += ["-i", p]
     n = len(input_paths)
