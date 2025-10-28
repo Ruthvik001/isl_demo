@@ -24,9 +24,9 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
+COPY requirements-alpine-minimal.txt .
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements-alpine-minimal.txt
 
 # Stage 2: Runtime image
 FROM python:3.11-alpine as runtime
@@ -69,7 +69,8 @@ RUN mkdir -p output uploads
 # Create non-root user for security
 RUN addgroup -g 1001 -S appuser && \
     adduser -S -D -H -u 1001 -h /app -s /sbin/nologin -G appuser -g appuser appuser && \
-    chown -R appuser:appuser /app
+    chown -R appuser:appuser /app && \
+    chown -R appuser:appuser /home/appuser
 USER appuser
 
 # Expose Streamlit port

@@ -180,13 +180,19 @@ def collect_clip_sequence(tokens: List[str], index_norm: Dict[str, str]) -> List
     return clip_paths
 
 def get_ffmpeg_bin() -> str:
-    # Prefer bundled ffmpeg if available
+    # Prefer system ffmpeg first (more reliable)
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    
+    # Fallback to bundled ffmpeg if available
     if iio_ffmpeg:
         try:
             return iio_ffmpeg.get_ffmpeg_exe()
         except Exception:
             pass
-    return shutil.which("ffmpeg") or "ffmpeg"
+    
+    return "ffmpeg"
 
 def concat_videos_ffmpeg(input_paths: List[str], output_path: Path) -> None:
     if not input_paths:

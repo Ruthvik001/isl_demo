@@ -72,8 +72,9 @@ COPY video_files/ ./video_files/
 RUN mkdir -p output uploads
 
 # Create non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser appuser && \
-    chown -R appuser:appuser /app
+RUN groupadd -r appuser && useradd -r -g appuser -m appuser && \
+    chown -R appuser:appuser /app && \
+    chown -R appuser:appuser /home/appuser
 USER appuser
 
 # Expose Streamlit port

@@ -147,7 +147,19 @@ def concat_videos_ffmpeg(input_paths: list[str], output_path: Path) -> None:
     if not input_paths:
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg_bin = iio_ffmpeg.get_ffmpeg_exe() if iio_ffmpeg else (shutil.which("ffmpeg") or "ffmpeg")
+    
+    # Prefer system ffmpeg first (more reliable)
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        ffmpeg_bin = system_ffmpeg
+    elif iio_ffmpeg:
+        try:
+            ffmpeg_bin = iio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg_bin = "ffmpeg"
+    else:
+        ffmpeg_bin = "ffmpeg"
+    
     cmd: list[str] = [ffmpeg_bin, "-y"]
     for p in input_paths:
         cmd += ["-i", p]
