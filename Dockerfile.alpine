@@ -1,0 +1,83 @@
+# Ultra-optimized Dockerfile using Alpine Linux
+# Stage 1: Build dependencies
+FROM python:3.11-alpine as builder
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install build dependencies
+RUN apk add --no-cache \
+    build-base \
+    gcc \
+    g++ \
+    musl-dev \
+    libffi-dev \
+    openssl-dev \
+    libsndfile-dev \
+    linux-headers
+
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Stage 2: Runtime image
+FROM python:3.11-alpine as runtime
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# Install only runtime dependencies
+RUN apk add --no-cache \
+    # FFmpeg for video processing
+    ffmpeg \
+    # Runtime audio libraries
+    libsndfile \
+    # Essential runtime libraries
+    libgomp \
+    # Health check tool
+    curl \
+    # Clean up
+    && rm -rf /var/cache/apk/*
+
+# Copy virtual environment from builder stage
+COPY --from=builder /opt/venv /opt/venv
+
+# Set working directory
+WORKDIR /app
+
+# Copy only necessary application files
+COPY app.py .
+COPY audio_transcription.py .
+
+# Copy video files directory (only if it exists)
+# This allows the app to work without mounting volumes
+COPY video_files/ ./video_files/
+
+# Create necessary directories
+RUN mkdir -p output uploads
+
+# Create non-root user for security
+RUN addgroup -g 1001 -S appuser && \
+    adduser -S -D -H -u 1001 -h /app -s /sbin/nologin -G appuser -g appuser appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# Expose Streamlit port
+EXPOSE 8501
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8501/_stcore/health || exit 1
+
+# Run the application
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--server.enableCORS=false", "--server.enableXsrfProtection=false"]

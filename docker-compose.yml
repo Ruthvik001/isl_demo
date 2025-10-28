@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  isl-demo:
+    # Use the optimized multi-stage Dockerfile by default
+    # For Alpine version (smallest), uncomment the next line and comment the build line
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.alpine
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      # Set your Google API key here or use .env file
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      # Optional: Set to "0" to use HF Whisper instead of Faster-Whisper
+      - USE_FASTER_WHISPER=1
+    volumes:
+      # Mount output directory to persist generated videos
+      - ./output:/app/output
+      # Mount uploads directory to persist uploaded files
+      - ./uploads:/app/uploads
+      # Video files: Choose one option below:
+      # Option 1: Videos included in image (no mount needed) - DEFAULT
+      # (No mount means videos are baked into the image)
+      # Option 2: Mount videos from host (for smaller image size)
+      # Uncomment the line below to use external videos instead:
+      # - ./video_files:/app/video_files:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+# Optional: If you want to use a .env file for environment variables
+# Create a .env file in the same directory with:
+# GOOGLE_API_KEY=your_google_api_key_here
