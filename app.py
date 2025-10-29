@@ -199,6 +199,22 @@ def concat_videos_ffmpeg(input_paths: List[str], output_path: Path) -> None:
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg_bin = get_ffmpeg_bin()
+    
+    # Verify FFmpeg is accessible
+    try:
+        test_result = subprocess.run(
+            [ffmpeg_bin, "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if test_result.returncode != 0:
+            raise RuntimeError(f"FFmpeg test failed with return code {test_result.returncode}")
+    except FileNotFoundError:
+        raise RuntimeError(f"FFmpeg not found at: {ffmpeg_bin}. Please ensure FFmpeg is installed.")
+    except Exception as e:
+        raise RuntimeError(f"FFmpeg verification failed: {str(e)}")
+    
     cmd: List[str] = [ffmpeg_bin, "-y"]
 
     # Inputs
@@ -226,7 +242,15 @@ def concat_videos_ffmpeg(input_paths: List[str], output_path: Path) -> None:
         "-movflags", "+faststart",
         str(output_path),
     ]
-    subprocess.run(cmd, check=True)
+    
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            cmd,
+            result.stdout,
+            result.stderr
+        )
 
 # ---------- Find video dir ----------
 video_dir: Optional[Path] = None
@@ -296,8 +320,10 @@ if run_btn:
     with st.spinner("Concatenating clips..."):
         try:
             concat_videos_ffmpeg(clip_paths, out_path)
-        except subprocess.CalledProcessError as e:
-            st.error("ffmpeg failed. Ensure `imageio-ffmpeg` is installed or system ffmpeg is available.")
+        except (subprocess.CalledProcessError, RuntimeError) as e:
+            st.error(f"FFmpeg error: {str(e)}")
+            if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+                st.code(e.stderr, language="text")
             st.exception(e)
             st.stop()
 

@@ -37,13 +37,17 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# Load Whisper once
-processor = WhisperProcessor.from_pretrained("openai/whisper-large-v2", language="en", task="transcribe")
-model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v2")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
-model.eval()
-model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
+# Lazy load Whisper models (cache with Streamlit)
+@st.cache_resource
+def load_whisper_model():
+    """Load Whisper model and processor - cached by Streamlit"""
+    processor = WhisperProcessor.from_pretrained("openai/whisper-small", language="en", task="transcribe")
+    model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+    model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
+    return processor, model, device
 
 
 # ---------- Gloss Prompt ----------
@@ -57,10 +61,12 @@ GENERAL CONSTRAINTS
 - Tokens must be UPPERCASE, space-separated; no punctuation.
 - Preserve meaning; drop English articles ("a", "an", "the").
 - Prefer ISL SOV: NP NP VP when applicable.
-- Don’t invent lexemes; keep lemma-like tokens (EAT, BLUE, HAVE).
+- Don't invent lexemes; keep lemma-like tokens (EAT, BLUE, HAVE).
 - If unsure, keep the closest English lemma.
 - Multiword verbs: use underscore, e.g., TALK_ABOUT.
 - Proper nouns/pronouns remain as tokens (RAVI, DELHI, HE, YOU).
+- For public announcements/formal addresses, omit redundant pronouns when the addressee is clear from context.
+- "your attention" in announcements can be simplified to "ATTENTION" when the context is clearly addressing everyone.
 
 STRICTNESS
 - Always return valid single-line JSON. No extra commentary, no markdown fences.
@@ -78,11 +84,16 @@ Example 3
 EN: He ran quickly.
 ISL: {"gloss":"HE RUN QUICKLY","notes":"adv after verb"}
 
+Example 4
+EN: May I have your attention please?
+ISL: {"gloss":"ATTENTION PLEASE","notes":"public announcement; 'your' dropped as redundant in context"}
+
 """
 
 
 # ---------- Helpers ----------
 def transcribe_audio(path: Path) -> str:
+    processor, model, device = load_whisper_model()
     audio, _sr = librosa.load(str(path), sr=16000, mono=True)
     inputs = processor(audio, sampling_rate=16000, return_tensors="pt")
     input_features = inputs.input_features.to(device)
@@ -160,29 +171,125 @@ def concat_videos_ffmpeg(input_paths: list[str], output_path: Path) -> None:
     else:
         ffmpeg_bin = "ffmpeg"
     
-    cmd: list[str] = [ffmpeg_bin, "-y"]
-    for p in input_paths:
-        cmd += ["-i", p]
     n = len(input_paths)
-    per_input_filters = []
-    for i in range(n):
-        per_input_filters.append(
-            f"[{i}:v]scale=640:360:force_original_aspect_ratio=decrease,"
-            f"pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v{i}]"
-        )
-    concat_inputs = "".join(f"[v{i}]" for i in range(n))
-    filter_graph = ";".join(per_input_filters) + f";{concat_inputs}concat=n={n}:v=1:a=0[v]"
-    cmd += [
-        "-filter_complex", filter_graph,
-        "-map", "[v]",
-        "-an",
-        "-c:v", "libx264",
-        "-r", "25",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        str(output_path),
-    ]
-    subprocess.run(cmd, check=True)
+    
+    # For large numbers of videos, process in smaller batches to avoid memory issues
+    # Process in batches of 20 videos to prevent OOM
+    BATCH_SIZE = 20
+    if n > BATCH_SIZE:
+        # Process in batches, then concat the intermediate files
+        temp_dir = output_path.parent / "temp_concats"
+        temp_dir.mkdir(exist_ok=True)
+        intermediate_files = []
+        
+        for batch_start in range(0, n, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, n)
+            batch_paths = input_paths[batch_start:batch_end]
+            batch_n = len(batch_paths)
+            
+            if batch_n == 1:
+                # Single file, just scale it
+                intermediate_file = temp_dir / f"batch_{batch_start}.mp4"
+                cmd = [
+                    ffmpeg_bin, "-y", "-i", batch_paths[0],
+                    "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p",
+                    "-c:v", "libx264", "-r", "25", "-pix_fmt", "yuv420p",
+                    "-threads", "4",  # Limit threads to reduce memory usage
+                    str(intermediate_file)
+                ]
+            else:
+                # Multiple files, use filter_complex
+                intermediate_file = temp_dir / f"batch_{batch_start}.mp4"
+                cmd = [ffmpeg_bin, "-y"]
+                for p in batch_paths:
+                    cmd += ["-i", p]
+                
+                per_input_filters = []
+                for i in range(batch_n):
+                    per_input_filters.append(
+                        f"[{i}:v]scale=640:360:force_original_aspect_ratio=decrease,"
+                        f"pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v{i}]"
+                    )
+                concat_inputs = "".join(f"[v{i}]" for i in range(batch_n))
+                filter_graph = ";".join(per_input_filters) + f";{concat_inputs}concat=n={batch_n}:v=1:a=0[v]"
+                cmd += [
+                    "-filter_complex", filter_graph,
+                    "-map", "[v]",
+                    "-threads", "4",  # Limit threads to reduce memory usage
+                    "-c:v", "libx264",
+                    "-r", "25",
+                    "-pix_fmt", "yuv420p",
+                    str(intermediate_file)
+                ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    result.returncode, cmd, result.stdout, result.stderr
+                )
+            intermediate_files.append(str(intermediate_file))
+        
+        # Now concat all intermediate files
+        if len(intermediate_files) == 1:
+            # Only one batch, just move it
+            shutil.move(intermediate_files[0], str(output_path))
+        else:
+            # Create concat file for demuxer (more memory efficient)
+            concat_file = temp_dir / "concat_list.txt"
+            with open(concat_file, "w") as f:
+                for file in intermediate_files:
+                    f.write(f"file '{file}'\n")
+            
+            cmd = [
+                ffmpeg_bin, "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", str(concat_file),
+                "-c", "copy",  # Copy codec (no re-encoding needed since all are same format)
+                "-movflags", "+faststart",
+                str(output_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    result.returncode, cmd, result.stdout, result.stderr
+                )
+        
+        # Clean up temporary files
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            pass  # Ignore cleanup errors
+    
+    else:
+        # Small number of videos, use original approach but with thread limit
+        cmd: list[str] = [ffmpeg_bin, "-y"]
+        for p in input_paths:
+            cmd += ["-i", p]
+        
+        per_input_filters = []
+        for i in range(n):
+            per_input_filters.append(
+                f"[{i}:v]scale=640:360:force_original_aspect_ratio=decrease,"
+                f"pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v{i}]"
+            )
+        concat_inputs = "".join(f"[v{i}]" for i in range(n))
+        filter_graph = ";".join(per_input_filters) + f";{concat_inputs}concat=n={n}:v=1:a=0[v]"
+        cmd += [
+            "-filter_complex", filter_graph,
+            "-map", "[v]",
+            "-threads", "4",  # Limit threads to reduce memory usage
+            "-an",
+            "-c:v", "libx264",
+            "-r", "25",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd, result.stdout, result.stderr
+            )
 
 
 
