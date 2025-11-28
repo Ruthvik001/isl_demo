@@ -37,6 +37,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
+<<<<<<< Updated upstream
 # Lazy load Whisper models (cache with Streamlit)
 @st.cache_resource
 def load_whisper_model():
@@ -48,6 +49,15 @@ def load_whisper_model():
     model.eval()
     model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
     return processor, model, device
+=======
+# Load Whisper once
+processor = WhisperProcessor.from_pretrained("openai/whisper-small", language="en", task="transcribe")
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+model.eval()
+model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
+>>>>>>> Stashed changes
 
 
 # ---------- Gloss Prompt ----------

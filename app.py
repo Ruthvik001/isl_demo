@@ -36,6 +36,7 @@ USE_FASTER_WHISPER = os.getenv("USE_FASTER_WHISPER", "1") not in ("0", "false", 
 # ---------- App paths ----------
 BASE_DIR = Path(__file__).resolve().parent
 VIDEO_DIR_CANDIDATES = [
+    BASE_DIR / "animated_videos",
     BASE_DIR / "video_files",
     (BASE_DIR.parent / "ISL" / "video_files"),
 ]
@@ -137,47 +138,204 @@ def get_gemini_llm():
         max_retries=2,
     )
 
-def gemini_gloss(sentence: str) -> str:
+def extract_train_info(transcription: str) -> Dict:
+    """
+    Extract train information from transcription using LLM.
+    Returns: train_number, train_name, from_city, to_city, platform_number,
+    arrival_hour, arrival_minute
+    """
     llm = get_gemini_llm()
+    
+    extraction_prompt = """You are parsing Indian train station announcements.
+
+Extract the following information from the transcription.
+Return ONLY valid JSON with these exact fields (use null if not found):
+
+{
+  "train_number": "12345",
+  "train_name": "EXPRESS NAME",
+  "from_city": "CITY1",
+  "to_city": "CITY2",
+  "platform_number": "1",
+  "arrival_hour": "14",
+  "arrival_minute": "30"
+}
+
+Rules:
+- Extract exact values from transcription.
+- Use UPPERCASE for city and train names.
+- For time, if you hear something like 'at 7:30 PM' or 'at 19 30 hours',
+  convert to 24-hour format and fill hour and minute as strings.
+- If arrival time is not present, set both arrival_hour and arrival_minute to null.
+- Return only the JSON, no markdown, no extra text.
+"""
+    
     messages = [
-        ("system", SYSTEM_PROMPT),
-        ("human", FEW_SHOTS),
-        ("human", f"Convert to ISL GLOSS and return JSON only.\nSentence:\n{sentence}"),
+        ("system", extraction_prompt),
+        ("human", f"Transcription:\n{transcription}"),
     ]
+    
     ai_msg = llm.invoke(messages)
-    return getattr(ai_msg, "content", str(ai_msg)).strip()
+    response = getattr(ai_msg, "content", str(ai_msg)).strip()
+    
+    # Parse JSON response
+    try:
+        # Remove markdown code blocks if present
+        if "```" in response:
+            response = response.split("```")[1]
+            if response.startswith("json"):
+                response = response[4:]
+        
+        info = json.loads(response)
+        return {
+            "train_number": info.get("train_number"),
+            "train_name": info.get("train_name"),
+            "from_city": info.get("from_city"),
+            "to_city": info.get("to_city"),
+            "platform_number": info.get("platform_number"),
+            "arrival_hour": info.get("arrival_hour"),
+            "arrival_minute": info.get("arrival_minute"),
+        }
+    except Exception as e:
+        st.error(f"Failed to parse LLM response: {e}")
+        return {
+            "train_number": None,
+            "train_name": None,
+            "from_city": None,
+            "to_city": None,
+            "platform_number": None,
+            "arrival_hour": None,
+            "arrival_minute": None,
+        }
 
 # ---------- Clips & concat ----------
 @st.cache_data
 def build_video_file_index(directory_path: Path) -> Dict[str, str]:
+    """
+    Build index of video files. Supports .mp4 and .mov.
+    Keys are normalized: "Good-Afternoon.mov" -> "GOOD AFTERNOON"
+    """
     if not directory_path.is_dir():
         return {}
     index: Dict[str, str] = {}
     for entry in sorted(directory_path.iterdir()):
-        if entry.is_file() and entry.suffix.lower() == ".mp4":
-            index[entry.stem.upper()] = str(entry)
+        if entry.is_file() and entry.suffix.lower() in (".mp4", ".mov"):
+            # Normalize: replace hyphens/underscores with spaces, uppercase
+            normalized_key = entry.stem.replace("-", " ").replace("_", " ").upper()
+            index[normalized_key] = str(entry)
     return index
 
-def parse_gloss_tokens(raw_gloss: str) -> List[str]:
-    try:
-        obj = json.loads(raw_gloss)
-        gloss_str = obj.get("gloss", "")
-        return [tok.strip().upper() for tok in gloss_str.split() if tok.strip()]
-    except Exception:
-        return [tok.strip().upper() for tok in raw_gloss.split() if tok.strip()]
+def generate_template_tokens(train_info: Dict) -> List[str]:
+    """
+    Generate token sequence from standard templates.
+
+    Template 1 (no time):
+    ATTENTION PLEASE TRAIN NUMBER {train_number} {train_name}
+    FROM {from_city} TO {to_city} PLATFORM NUMBER {platform_number} ARRIVE SOON
+
+    Template 2 (with arrival time, when hour & minute present):
+    ATTENTION PLEASE TRAIN NUMBER {train_number} {train_name}
+    FROM {from_city} TO {to_city}
+    ARRIVAL TIME {arrival_hour} HOUR {arrival_minute} MINUTE
+    PLATFORM NUMBER {platform_number} ARRIVE SOON
+    """
+    template_tokens = ["ATTENTION", "PLEASE", "TRAIN", "NUMBER"]
+    
+    # Add train number digits
+    if train_info["train_number"]:
+        for digit in str(train_info["train_number"]):
+            template_tokens.append(digit)
+    
+    # Add train name
+    if train_info["train_name"]:
+        template_tokens.append(train_info["train_name"])
+
+    # Add FROM / TO cities
+    template_tokens.append("FROM")
+    if train_info["from_city"]:
+        template_tokens.append(train_info["from_city"])
+
+    template_tokens.append("TO")
+    if train_info["to_city"]:
+        template_tokens.append(train_info["to_city"])
+
+    # If we have arrival time, use Template 2
+    has_time = bool(train_info.get("arrival_hour")) and bool(train_info.get("arrival_minute"))
+    if has_time:
+        template_tokens.extend(["ARRIVAL", "TIME"])
+        for digit in str(train_info["arrival_hour"]):
+            template_tokens.append(digit)
+        template_tokens.append("HOUR")
+        for digit in str(train_info["arrival_minute"]):
+            template_tokens.append(digit)
+        template_tokens.append("MINUTE")
+
+    # PLATFORM NUMBER (used in both templates)
+    template_tokens.extend(["PLATFORM", "NUMBER"])
+    if train_info["platform_number"]:
+        for digit in str(train_info["platform_number"]):
+            template_tokens.append(digit)
+
+    # ARRIVE SOON closing
+    template_tokens.extend(["ARRIVE", "SOON"])
+    
+    return template_tokens
 
 def collect_clip_sequence(tokens: List[str], index_norm: Dict[str, str]) -> List[str]:
-    clip_paths: List[str] = []
-    for token in tokens:
-        if token in index_norm:
-            clip_paths.append(index_norm[token])
+    SMART_MAPPINGS = {
+        "EXPRESS": "EXPRESS TRAIN",
+        "PLATFORM": "PLACE PLATFORM NO",
+        "REACH": "SOON REACH TIME",
+        "SOON": "SOON REACH TIME",
+    }
+    
+    clip_paths = []
+    i = 0
+    
+    while i < len(tokens):
+        matched = False
+        
+        # Try longest multi-word match first
+        for phrase_len in range(min(5, len(tokens)-i), 0, -1):
+            phrase = " ".join(tokens[i:i+phrase_len])
+            if phrase in index_norm:
+                clip_paths.append(index_norm[phrase])
+                i += phrase_len
+                matched = True
+                break
+        
+        if matched:
             continue
-        # fallback: per-letter
+        
+        # Smart mapping
+        token = tokens[i]
+        if token in SMART_MAPPINGS:
+            mapped_phrase = SMART_MAPPINGS[token]
+            if mapped_phrase in index_norm:
+                clip_paths.append(index_norm[mapped_phrase])
+                i += 1
+                continue
+        
+        # Fallback: per-letter ONLY if all letters exist
+        token_letters = []
+        all_letters_found = True
+        
         for ch in token:
-            ch_up = ch.upper()
-            if ch_up in index_norm:
-                clip_paths.append(index_norm[ch_up])
+            if ch.upper() in index_norm:
+                token_letters.append(index_norm[ch.upper()])
+            else:
+                all_letters_found = False
+                break
+        
+        if all_letters_found and token_letters:
+            clip_paths.extend(token_letters)
+            i += 1
+        else:
+            # If everything fails: skip safely to avoid infinite loop
+            i += 1
+    
     return clip_paths
+
 
 def get_ffmpeg_bin() -> str:
     # Prefer system ffmpeg first (more reliable)
@@ -260,12 +418,72 @@ for cand in VIDEO_DIR_CANDIDATES:
         break
 
 if not video_dir:
-    st.error("Could not find `video_files/`. Create it next to this script and place clips there (A-Z & common words).")
+    st.error("Could not find `animated_videos/` or `video_files/`. Create it next to this script and place clips there.")
     st.stop()
 
 index = build_video_file_index(video_dir)
 if not index:
-    st.info("`video_files/` is present but empty. Add .mp4 clips named like A.mp4, B.mp4, HELLO.mp4, etc.")
+    st.info(f"`{video_dir.name}/` is present but empty. Add .mp4/.mov clips for ISL signs.")
+
+# ---------- Available data for user selection ----------
+AVAILABLE_CITIES = ["BHOPAL", "BENGALURU", "COIMBATORE", "DELHI", "KARNATAKA", 
+                    "NIZAMABAD", "MUMBAI", "ODISHA", "RAJASTHAN", "BANGALORE"]
+AVAILABLE_NUMBERS = ["0", "1", "2", "4", "5", "8"]
+
+def extract_cities_from_text(text: str) -> List[str]:
+    """
+    Extract potential city names from transcription text.
+    Looks for patterns like "from X to Y" or standalone proper nouns.
+    """
+    import re
+    cities_found = []
+    text_upper = text.upper()
+    
+    # Pattern 1: "from CITY to CITY"
+    from_to_pattern = r'FROM\s+(\w+)(?:\s+TO\s+(\w+))?'
+    matches = re.findall(from_to_pattern, text_upper)
+    for match in matches:
+        for city in match:
+            if city and len(city) > 2:  # Avoid short words
+                cities_found.append(city)
+    
+    # Pattern 2: "to CITY"
+    to_pattern = r'TO\s+(\w+)'
+    matches = re.findall(to_pattern, text_upper)
+    for city in matches:
+        if city and len(city) > 2:
+            cities_found.append(city)
+    
+    return list(set(cities_found))  # Remove duplicates
+
+def detect_missing_entities(tokens: List[str], index_norm: Dict[str, str]) -> Dict:
+    """
+    Detect which specific cities and numbers in tokens are NOT available in our database.
+    Returns dict with lists of missing cities and missing numbers that need replacement.
+    """
+    missing_cities = []
+    missing_numbers = []
+    
+    for token in tokens:
+        token_upper = token.upper()
+        
+        # Check if it looks like a city (not in available cities and not in index)
+        # City detection: proper noun-like (capitalized or all caps) and not a common word
+        if token_upper not in index_norm and len(token) > 2:
+            # Check if it's a potential city (from transcription context)
+            potential_cities = extract_cities_from_text(" ".join(tokens))
+            if token_upper in potential_cities and token_upper not in AVAILABLE_CITIES:
+                missing_cities.append(token_upper)
+        
+        # Check if it's a number that's not available
+        if token.isdigit() or token_upper.isdigit():
+            if token not in AVAILABLE_NUMBERS and token_upper not in AVAILABLE_NUMBERS:
+                missing_numbers.append(token)
+    
+    return {
+        "missing_cities": list(set(missing_cities)),  # Remove duplicates
+        "missing_numbers": list(set(missing_numbers))
+    }
 
 # ---------- Uploader ----------
 uploaded = st.file_uploader("Upload audio/video file", type=["mp3", "wav", "m4a", "mp4", "mov"])
@@ -284,7 +502,17 @@ with col2:
     engine = "Faster-Whisper" if USE_FASTER_WHISPER else "HF Whisper (base)"
     st.caption(f"Transcription engine: **{engine}**")
 
-# ---------- Main action ----------
+# ---------- Session state for pipeline ----------
+if "text" not in st.session_state:
+    st.session_state.text = None
+if "train_info" not in st.session_state:
+    st.session_state.train_info = None
+if "final_train_info" not in st.session_state:
+    st.session_state.final_train_info = None
+if "replacements_done" not in st.session_state:
+    st.session_state.replacements_done = False
+
+# ---------- Handle button: run transcription + extraction once ----------
 if run_btn:
     if uploaded is None or tmp_path is None:
         st.error("Please upload a file first.")
@@ -296,24 +524,198 @@ if run_btn:
         except Exception as e:
             st.exception(e)
             st.stop()
-    st.subheader("Transcription")
-    st.write(text or "(empty)")
+    st.session_state.text = text
 
-    with st.spinner("Generating ISL gloss (Gemini)..."):
+    with st.spinner("Extracting train information (Gemini)..."):
         try:
-            raw_gloss = gemini_gloss(text)
-            tokens = parse_gloss_tokens(raw_gloss)
+            train_info = extract_train_info(text)
         except Exception as e:
             st.exception(e)
             st.stop()
+    st.session_state.train_info = train_info
 
-    st.subheader("ISL Gloss (JSON)")
-    st.code(raw_gloss)
+    # Reset replacement state for this transcription
+    st.session_state.replacements_done = False
+    st.session_state.final_train_info = None
+
+# ---------- Main pipeline: runs whenever we have extracted info ----------
+text = st.session_state.get("text")
+base_train_info = st.session_state.get("final_train_info") or st.session_state.get("train_info")
+
+if base_train_info:
+    train_info = base_train_info.copy()
+
+    # Show transcription
+    st.subheader("Transcription")
+    st.write(text or "(empty)")
+
+    # Show current train info
+    st.subheader("📋 Current Information")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write(f"**Train Number:** {train_info['train_number'] or 'Not found'}")
+        st.write(f"**Train Name:** {train_info['train_name'] or 'Not found'}")
+        st.write(f"**Platform:** {train_info['platform_number'] or 'Not found'}")
+    with col2:
+        st.write(f"**From City:** {train_info['from_city'] or 'Not found'}")
+        st.write(f"**To City:** {train_info['to_city'] or 'Not found'}")
+
+    # Check what needs replacement (only if not already done)
+    needs_replacement: Dict[str, str] = {}
+    if not st.session_state.get("replacements_done", False):
+        # Check cities
+        if train_info["from_city"] and train_info["from_city"] not in AVAILABLE_CITIES:
+            needs_replacement["from_city"] = train_info["from_city"]
+        if train_info["to_city"] and train_info["to_city"] not in AVAILABLE_CITIES:
+            needs_replacement["to_city"] = train_info["to_city"]
+
+        # Check train number digits
+        if train_info["train_number"]:
+            missing_train_digits = [d for d in str(train_info["train_number"]) if d not in AVAILABLE_NUMBERS]
+            if missing_train_digits:
+                needs_replacement["train_number"] = train_info["train_number"]
+        # Check time digits (arrival_hour / arrival_minute)
+        if train_info.get("arrival_hour"):
+            missing_h_digits = [d for d in str(train_info["arrival_hour"]) if d not in AVAILABLE_NUMBERS]
+            if missing_h_digits:
+                needs_replacement["arrival_hour"] = train_info["arrival_hour"]
+        if train_info.get("arrival_minute"):
+            missing_m_digits = [d for d in str(train_info["arrival_minute"]) if d not in AVAILABLE_NUMBERS]
+            if missing_m_digits:
+                needs_replacement["arrival_minute"] = train_info["arrival_minute"]
+
+        # Check platform number digits
+        if train_info["platform_number"]:
+            missing_platform_digits = [d for d in str(train_info["platform_number"]) if d not in AVAILABLE_NUMBERS]
+            if missing_platform_digits:
+                needs_replacement["platform_number"] = train_info["platform_number"]
+
+    # If there are items needing replacement, show form and wait for valid input
+    if needs_replacement:
+        st.warning("⚠️ Some extracted information is not available in our video database.")
+
+        st.error("**Items needing replacement:**")
+        for key, value in needs_replacement.items():
+            st.write(f"- **{key.replace('_', ' ').title()}:** {value}")
+
+        st.info("Please select available alternatives from our database:")
+
+        with st.form("replacement_form"):
+            replacements: Dict[str, str] = {}
+
+            # From City replacement
+            if "from_city" in needs_replacement:
+                st.write("### From City")
+                st.caption(f"Original: {needs_replacement['from_city']}")
+                replacements["from_city"] = st.selectbox(
+                    "Select replacement city:",
+                    options=[""] + AVAILABLE_CITIES,
+                    key="replace_from_city"
+                )
+
+            # To City replacement
+            if "to_city" in needs_replacement:
+                st.write("### To City")
+                st.caption(f"Original: {needs_replacement['to_city']}")
+                replacements["to_city"] = st.selectbox(
+                    "Select replacement city:",
+                    options=[""] + AVAILABLE_CITIES,
+                    key="replace_to_city"
+                )
+
+            # Train Number replacement
+            if "train_number" in needs_replacement:
+                st.write("### Train Number")
+                st.caption(f"Original: {needs_replacement['train_number']}")
+                st.info("Enter a new train number using only available digits: " + ", ".join(AVAILABLE_NUMBERS))
+                replacements["train_number"] = st.text_input(
+                    "New train number:",
+                    max_chars=10,
+                    key="replace_train_number",
+                    help="Use only digits: " + ", ".join(AVAILABLE_NUMBERS)
+                )
+
+            # Platform Number replacement
+            if "platform_number" in needs_replacement:
+                st.write("### Platform Number")
+                st.caption(f"Original: {needs_replacement['platform_number']}")
+                replacements["platform_number"] = st.selectbox(
+                    "Select replacement platform:",
+                    options=[""] + AVAILABLE_NUMBERS,
+                    key="replace_platform_number"
+                )
+
+            # Arrival time replacements (optional; only if present)
+            if "arrival_hour" in needs_replacement:
+                st.write("### Arrival Hour")
+                st.caption(f"Original: {needs_replacement['arrival_hour']}")
+                replacements["arrival_hour"] = st.text_input(
+                    "New arrival hour (HH):",
+                    max_chars=2,
+                    key="replace_arrival_hour",
+                    help="Use only digits: " + ", ".join(AVAILABLE_NUMBERS)
+                )
+            if "arrival_minute" in needs_replacement:
+                st.write("### Arrival Minute")
+                st.caption(f"Original: {needs_replacement['arrival_minute']}")
+                replacements["arrival_minute"] = st.text_input(
+                    "New arrival minute (MM):",
+                    max_chars=2,
+                    key="replace_arrival_minute",
+                    help="Use only digits: " + ", ".join(AVAILABLE_NUMBERS)
+                )
+
+            submit_form = st.form_submit_button("Generate Video with Replacements", type="primary")
+
+        if not submit_form:
+            # Wait for user to submit the form before generating video
+            st.stop()
+
+        # Validate that all replacements are provided
+        all_valid = True
+        for key in needs_replacement.keys():
+            if key not in replacements or not replacements[key]:
+                st.error(f"Please provide a replacement for: {key.replace('_', ' ').title()}")
+                all_valid = False
+
+            # Validate any numeric field (train number, time, platform) uses only available digits
+            if key in ("train_number", "arrival_hour", "arrival_minute", "platform_number") and replacements.get(key):
+                invalid_digits = [d for d in str(replacements[key]) if d not in AVAILABLE_NUMBERS]
+                if invalid_digits:
+                    st.error(f"{key.replace('_', ' ').title()} contains unavailable digits: {', '.join(invalid_digits)}")
+                    all_valid = False
+
+        if not all_valid:
+            st.stop()
+
+        # Apply replacements directly to train_info
+        for key, value in replacements.items():
+            if value:
+                st.success(f"✓ Replaced {key.replace('_', ' ').title()}: '{needs_replacement[key]}' → '{value}'")
+                train_info[key] = value
+
+        # Mark replacements done for this transcription
+        st.session_state.replacements_done = True
+        st.session_state.final_train_info = train_info.copy()
+
+    # At this point, train_info contains final values (original or replaced)
+    tokens = generate_template_tokens(train_info)
+
+    st.subheader("📝 Generated Announcement Template")
+    st.code(" ".join(tokens))
+
+    # Proceed with video generation
+    st.write("---")
+    st.write("### 🎬 Generating Video...")
 
     clip_paths = collect_clip_sequence(tokens, index)
 
-    if not clip_paths:
-        st.warning("No matching clips found for tokens (and letters). Add more word/letter clips to `video_files/`.")
+    # Debug: show what clips were found
+    if clip_paths:
+        st.info(f"✓ Found {len(clip_paths)} video clips to stitch")
+    else:
+        st.error(f"❌ No matching clips found for tokens: {tokens}")
+        st.warning(f"Available clips in database: {list(index.keys())[:10]}...")
         st.stop()
 
     out_path = OUTPUT_DIR / "isl_sequence.mp4"

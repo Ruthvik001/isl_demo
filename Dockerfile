@@ -61,7 +61,7 @@ COPY audio_transcription.py .
 
 # Copy video files directory (only if it exists)
 # This allows the app to work without mounting volumes
-COPY video_files/ ./video_files/
+COPY animated_videos/ ./animated_videos/
 
 # Create necessary directories
 RUN mkdir -p output uploads
@@ -80,4 +80,4 @@ HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
 # Run the application
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--server.enableCORS=false", "--server.enableXsrfProtection=false"]
+CMD ["streamlit", "run", "audio_transcription.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--server.enableCORS=false", "--server.enableXsrfProtection=false"]

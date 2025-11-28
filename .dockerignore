@@ -76,9 +76,6 @@ temp/
 # *.mkv
 # video_files/
 
-# Output files (will be created at runtime)
-output/
-uploads/
 
 # Node modules (if any)
 node_modules/
