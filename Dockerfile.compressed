@@ -66,7 +66,7 @@ COPY audio_transcription.py .
 
 # Copy and decompress video files if compressed (placeholder for compression step)
 # Video files will be copied normally - compression would need to be done separately
-COPY video_files/ ./video_files/
+COPY animated_videos/ ./animated_videos/
 
 # Create necessary directories
 RUN mkdir -p output uploads
